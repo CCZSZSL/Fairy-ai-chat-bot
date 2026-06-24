@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.pnpm-store/
+.pnpm-cache/
+.pnpm-state/
+.electron-cache/
+.electron-builder-cache/
+.chrome-fairy-profile/
+.tmp/
+fairy-memory/
+Fairy voice clone.m4a
+*.local
+*.sqlite
+*.db
+*.png
+*.jpg
+*.jpeg
+*.webm
+*.wav
+*.m4a
+*.mp3
+.fairy-vite.log
+.fairy-vite.err.log
+.fairy-server.log
+.fairy-server.err.log
+.fairy-electron.log
+.fairy-electron.err.log

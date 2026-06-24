@@ -15,14 +15,20 @@ if (-not (Test-Path $DistIndex)) {
   exit 1
 }
 
-$existing = Get-CimInstance Win32_Process -Filter "name = 'electron.exe'" -ErrorAction SilentlyContinue |
+$projectElectronProcesses = Get-CimInstance Win32_Process -Filter "name = 'electron.exe'" -ErrorAction SilentlyContinue |
   Where-Object {
     ($_.ExecutablePath -like "$ProjectRoot*") -or
     ($_.CommandLine -like "*$ProjectRoot*")
+  }
+
+$visibleWindow = Get-Process -Name "electron" -ErrorAction SilentlyContinue |
+  Where-Object {
+    ($_.Path -like "$ProjectRoot*") -and
+    (-not [string]::IsNullOrWhiteSpace($_.MainWindowTitle))
   } |
   Select-Object -First 1
 
-if ($existing) {
+if ($visibleWindow) {
   try {
     $shell = New-Object -ComObject WScript.Shell
     $shell.AppActivate("fairy") | Out-Null
@@ -30,6 +36,13 @@ if ($existing) {
     # Existing process is enough; activation is best-effort.
   }
   exit 0
+}
+
+if ($projectElectronProcesses) {
+  foreach ($process in $projectElectronProcesses) {
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Milliseconds 500
 }
 
 $env:FAIRY_LOAD_DIST = "1"

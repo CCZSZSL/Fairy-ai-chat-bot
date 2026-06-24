@@ -168,6 +168,9 @@ export function installMockBridge() {
         { source: "mock" },
       );
     },
+    async sendChatStream(content: string, context?: string, requestId?: string) {
+      return this.sendChat(content, context, requestId);
+    },
     async saveMessage(role, content, metadata) {
       try {
         return await apiFetch<FairyMessage>("/messages", {
@@ -251,6 +254,9 @@ export function installMockBridge() {
       }
       throw new Error("Custom TTS is available in the desktop bridge.");
     },
+    async synthesizeSpeechStream(text) {
+      return { streamed: false, ...(await this.synthesizeSpeech(text)) };
+    },
     async observeScreen(requestId?: string) {
       try {
         return await apiFetch<{
@@ -272,6 +278,12 @@ export function installMockBridge() {
       };
     },
     onScreenObserved() {
+      return () => {};
+    },
+    onChatStream() {
+      return () => {};
+    },
+    onSpeechStream() {
       return () => {};
     },
     async cancelRequest() {

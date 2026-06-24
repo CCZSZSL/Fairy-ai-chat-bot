@@ -264,18 +264,19 @@ function getRoute(capability) {
   const settings = loadSettings();
   const route = settings.modelRoutes?.[capability] || {};
   const secrets = loadLocalSecrets();
+  const provider = route.provider || "openai-compatible";
   return {
     baseUrl: route.baseUrl || settings.apiBaseUrl,
     apiKey:
       route.apiKey ||
       secrets.routes?.[capability]?.apiKey ||
-      secrets.providers?.[route.provider]?.apiKey ||
-      settings.apiKey,
+      secrets.providers?.[provider]?.apiKey ||
+      (isLocalModelProvider(provider) ? "" : settings.apiKey),
     model:
       route.model ||
       (capability === "vision" ? settings.visionModel : capability === "stt" ? settings.sttModel : settings.chatModel),
     endpoint: route.endpoint || "",
-    provider: route.provider || "openai-compatible",
+    provider,
     enabled: route.enabled !== false,
   };
 }
@@ -285,6 +286,75 @@ function getAuthHeaders(route, apiKey, json = true) {
   if (!apiKey) return headers;
   if (route.provider === "mimo") return { ...headers, "api-key": apiKey };
   return { ...headers, Authorization: `Bearer ${apiKey}` };
+}
+
+function isLocalModelProvider(provider) {
+  return provider === "local-openai" || provider === "ollama";
+}
+
+function getMessageText(content) {
+  if (typeof content === "string") return redactSecretsForModel(content);
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type === "text")
+    .map((part) => redactSecretsForModel(part.text || ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getMessageImages(content) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((part) => part?.type === "image_url" && part.image_url?.url)
+    .map((part) => String(part.image_url.url))
+    .map((url) => (url.startsWith("data:") ? url.slice(url.indexOf(",") + 1) : ""))
+    .filter(Boolean);
+}
+
+function toOllamaMessages(messages) {
+  return messages.map((message) => {
+    const next = {
+      role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",
+      content: getMessageText(message.content),
+    };
+    const images = getMessageImages(message.content);
+    if (images.length) next.images = images;
+    return next;
+  });
+}
+
+function stripReasoningTrace(content) {
+  return String(content || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^Thinking\.\.\.[\s\S]*?\.\.\.done thinking\.\s*/i, "")
+    .trim();
+}
+
+async function callOllamaChat(messages, route, model, maxTokens, temperature) {
+  const base = (route.baseUrl || "http://127.0.0.1:11434").replace(/\/$/, "");
+  const endpoint = route.endpoint || `${base}/api/chat`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: getAuthHeaders(route, route.apiKey),
+    body: JSON.stringify({
+      model,
+      messages: toOllamaMessages(messages),
+      stream: false,
+      think: false,
+      options: {
+        temperature,
+        num_predict: maxTokens,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Ollama API failed (${response.status}): ${text}`);
+  }
+
+  const json = await response.json();
+  return stripReasoningTrace(json.message?.content || json.response || "");
 }
 
 function saveMessage(role, content, metadata) {
@@ -331,14 +401,18 @@ function buildChatContext(userContent) {
 async function callChatCompletions(messages, options = {}) {
   const settings = loadSettings();
   const route = getRoute(options.capability || "chat");
-  const apiKey = route.apiKey || settings.apiKey;
+  const apiKey = route.apiKey;
   const baseUrl = route.baseUrl || settings.apiBaseUrl;
   const model = options.model || route.model || settings.chatModel;
   const maxTokens = clampNumber(options.maxTokens ?? settings.chatMaxTokens, 80, 2000, 280);
   const temperature = options.temperature ?? 0.7;
 
-  if (!apiKey) {
+  if (!apiKey && !isLocalModelProvider(route.provider)) {
     throw new Error("API key is not configured yet. Add a local secret or route API key in settings.");
+  }
+
+  if (route.provider === "ollama") {
+    return callOllamaChat(messages, route, model, maxTokens, temperature);
   }
 
   const endpoint = route.endpoint || `${baseUrl.replace(/\/$/, "")}/chat/completions`;

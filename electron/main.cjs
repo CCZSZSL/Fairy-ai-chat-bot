@@ -14,6 +14,20 @@ const activeRequestControllers = new Map();
 
 const workspaceRoot = path.resolve(__dirname, "..");
 
+const MIMO_BASE_URL = "https://api.xiaomimimo.com/v1";
+const MIMO_CHAT_COMPLETIONS_PATH = "/chat/completions";
+const MIMO_MODELS = {
+  chat: "mimo-v2.5-pro",
+  vision: "mimo-v2.5",
+  asr: "mimo-v2.5-asr",
+  tts: "mimo-v2.5-tts",
+  ttsVoiceDesign: "mimo-v2.5-tts-voicedesign",
+  ttsVoiceClone: "mimo-v2.5-tts-voiceclone",
+};
+const MIMO_PRESET_VOICES = new Set(["mimo_default", "\u51b0\u7cd6", "\u8309\u8389", "\u82cf\u6253", "\u767d\u6866", "Mia", "Chloe", "Milo", "Dean"]);
+const MIMO_DEFAULT_PRESET_VOICE = "\u8309\u8389";
+const MIMO_AUDIO_STREAM_SAMPLE_RATE = 24000;
+
 const SENSITIVE_KEYWORDS = [
   "password",
   "passcode",
@@ -109,11 +123,14 @@ const DEFAULT_SETTINGS = {
 const FAST_REPLY_INSTRUCTION =
   "Response speed matters. For normal chat and voice conversation, reply in 1-3 short natural sentences, usually under 80 Chinese characters. If the user asks for code, plans, or detailed analysis, be complete but still concise.";
 
+const MIMO_STABLE_PRESET_VOICE_INSTRUCTION =
+  "Use the exact same built-in preset speaker specified by audio.voice for every request. Do not randomize, redesign, or switch the speaker. Keep the same gender, age, accent, timbre, pitch range, speaking speed, emotional intensity, and microphone distance across all responses. Speak naturally in Mandarin Chinese, warm and conversational like a close phone call. Only synthesize the assistant text; do not add extra words.";
+
 const REQUEST_TIMEOUT_MS = {
   chat: 45_000,
   vision: 60_000,
   stt: 25_000,
-  tts: 35_000,
+  tts: 90_000,
 };
 
 function clampNumber(value, min, max, fallback) {
@@ -169,6 +186,31 @@ async function fetchWithTimeout(url, init = {}, options = {}) {
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abortFromParent);
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRetryAfterMs(response, fallbackMs = 3500) {
+  const retryAfter = response.headers.get("retry-after");
+  if (!retryAfter) return fallbackMs;
+  const retrySeconds = Number(retryAfter);
+  if (Number.isFinite(retrySeconds)) return clampNumber(retrySeconds * 1000, 1000, 15000, fallbackMs);
+  const retryDate = Date.parse(retryAfter);
+  if (Number.isFinite(retryDate)) return clampNumber(retryDate - Date.now(), 1000, 15000, fallbackMs);
+  return fallbackMs;
+}
+
+async function fetchWithRateLimitRetry(url, init = {}, options = {}) {
+  const maxRetries = clampNumber(options.maxRetries, 0, 5, 3);
+  let lastResponse = await fetchWithTimeout(url, init, options);
+  for (let attempt = 0; attempt < maxRetries && lastResponse.status === 429; attempt += 1) {
+    const retryDelay = getRetryAfterMs(lastResponse, 3500 * 2 ** attempt);
+    await sleep(retryDelay);
+    lastResponse = await fetchWithTimeout(url, init, options);
+  }
+  return lastResponse;
 }
 
 function ensureDir(dir) {
@@ -499,18 +541,19 @@ function getRoute(capability) {
   const settings = loadSettings();
   const route = settings.modelRoutes?.[capability] || {};
   const secrets = loadLocalSecrets();
+  const provider = route.provider || "openai-compatible";
   return {
     baseUrl: route.baseUrl || settings.apiBaseUrl,
     apiKey:
       route.apiKey ||
       secrets.routes?.[capability]?.apiKey ||
-      secrets.providers?.[route.provider]?.apiKey ||
-      settings.apiKey,
+      secrets.providers?.[provider]?.apiKey ||
+      (isLocalModelProvider(provider) ? "" : settings.apiKey),
     model:
       route.model ||
       (capability === "vision" ? settings.visionModel : capability === "stt" ? settings.sttModel : settings.chatModel),
     endpoint: route.endpoint || "",
-    provider: route.provider || "openai-compatible",
+    provider,
     enabled: route.enabled !== false,
   };
 }
@@ -526,12 +569,226 @@ function getAuthHeaders(route, apiKey, json = true) {
   return { ...headers, Authorization: `Bearer ${apiKey}` };
 }
 
+function getMimoChatEndpoint(route, fallbackBaseUrl = MIMO_BASE_URL) {
+  const base = (route.baseUrl || fallbackBaseUrl || MIMO_BASE_URL).replace(/\/$/, "");
+  return route.endpoint || `${base}${MIMO_CHAT_COMPLETIONS_PATH}`;
+}
+
+function isLocalModelProvider(provider) {
+  return provider === "local-openai" || provider === "ollama";
+}
+
+function buildMimoChatRequestBody({ model, messages, maxTokens, temperature, stream = false }) {
+  return {
+    model,
+    messages: messages.map(sanitizeMessageForModel),
+    max_completion_tokens: maxTokens,
+    temperature,
+    stream,
+    thinking: { type: "disabled" },
+  };
+}
+
+function getMimoPresetVoice(settings) {
+  const voice = String(settings.ttsVoiceId || "").trim();
+  return MIMO_PRESET_VOICES.has(voice) ? voice : MIMO_DEFAULT_PRESET_VOICE;
+}
+
+function getMimoTtsInstruction(model, voiceId, settings) {
+  if (model.includes("voiceclone")) {
+    return "Use the cloned voice sample as the timbre. Speak like a natural close companion on a phone call: gentle, clear, emotionally present, and a little faster than formal narration.";
+  }
+  if (model.includes("voicedesign")) {
+    return (
+      settings.ttsVoiceName ||
+      "Young Mandarin Chinese female voice, warm, clear, close conversational phone-call style, natural rhythm, stable timbre, gentle but not overly dramatic."
+    );
+  }
+  return `${MIMO_STABLE_PRESET_VOICE_INSTRUCTION} The selected voice id is "${voiceId}".`;
+}
+
+function getMessageText(content) {
+  if (typeof content === "string") return redactSecretsForModel(content);
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part) => part?.type === "text")
+    .map((part) => redactSecretsForModel(part.text || ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getMessageImages(content) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((part) => part?.type === "image_url" && part.image_url?.url)
+    .map((part) => String(part.image_url.url))
+    .map((url) => (url.startsWith("data:") ? url.slice(url.indexOf(",") + 1) : ""))
+    .filter(Boolean);
+}
+
+function toOllamaMessages(messages) {
+  return messages.map((message) => {
+    const next = {
+      role: message.role === "system" ? "system" : message.role === "assistant" ? "assistant" : "user",
+      content: getMessageText(message.content),
+    };
+    const images = getMessageImages(message.content);
+    if (images.length) next.images = images;
+    return next;
+  });
+}
+
+function stripReasoningTrace(content) {
+  return String(content || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^Thinking\.\.\.[\s\S]*?\.\.\.done thinking\.\s*/i, "")
+    .trim();
+}
+
+async function callOllamaChat(messages, options) {
+  const route = options.route;
+  const base = (route.baseUrl || "http://127.0.0.1:11434").replace(/\/$/, "");
+  const endpoint = route.endpoint || `${base}/api/chat`;
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: getAuthHeaders(route, route.apiKey),
+      body: JSON.stringify({
+        model: options.model,
+        messages: toOllamaMessages(messages),
+        stream: false,
+        think: false,
+        options: {
+          temperature: options.temperature,
+          num_predict: options.maxTokens,
+        },
+      }),
+    },
+    {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      label: "ollama API",
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Ollama API failed (${response.status}): ${text}`);
+  }
+
+  const json = await response.json();
+  return stripReasoningTrace(json.message?.content || json.response || "");
+}
+
+function sendChatStreamEvent(webContents, requestId, event) {
+  if (!webContents || webContents.isDestroyed()) return;
+  webContents.send("chat:stream", { requestId, ...event });
+}
+
+async function readStreamText(response, onText) {
+  if (!response.body?.getReader) return;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value) onText(decoder.decode(value, { stream: true }));
+  }
+  const tail = decoder.decode();
+  if (tail) onText(tail);
+}
+
+function readSseJsonBuffer(buffer, onJson) {
+  const lines = buffer.split(/\r?\n/);
+  const rest = lines.pop() || "";
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      onJson(JSON.parse(data));
+    } catch (error) {
+      console.warn("Ignored malformed SSE JSON chunk:", error);
+    }
+  }
+  return rest;
+}
+
+function getChatDeltaContent(json) {
+  return json.choices?.[0]?.delta?.content || json.choices?.[0]?.message?.content || "";
+}
+
+function getAudioDeltaBase64(json) {
+  return json.choices?.[0]?.delta?.audio?.data || "";
+}
+
+async function callOllamaChatStream(messages, options) {
+  const route = options.route;
+  const base = (route.baseUrl || "http://127.0.0.1:11434").replace(/\/$/, "");
+  const endpoint = route.endpoint || `${base}/api/chat`;
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: getAuthHeaders(route, route.apiKey),
+      body: JSON.stringify({
+        model: options.model,
+        messages: toOllamaMessages(messages),
+        stream: true,
+        think: false,
+        options: {
+          temperature: options.temperature,
+          num_predict: options.maxTokens,
+        },
+      }),
+    },
+    {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      label: "ollama API",
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Ollama API failed (${response.status}): ${text}`);
+  }
+
+  let buffer = "";
+  let fullText = "";
+  await readStreamText(response, (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const json = JSON.parse(trimmed);
+      const delta = stripReasoningTrace(json.message?.content || json.response || "");
+      if (delta) {
+        fullText += delta;
+        options.onDelta?.(delta);
+      }
+    }
+  });
+
+  return stripReasoningTrace(fullText);
+}
+
 function getAudioMimeType(filePath) {
   const extension = path.extname(filePath || "").toLowerCase();
   if (extension === ".wav") return "audio/wav";
   if (extension === ".mp3") return "audio/mpeg";
   if (extension === ".mpeg") return "audio/mpeg";
   return "";
+}
+
+function normalizeMimoAudioMimeType(mimeType, fallback = "audio/wav") {
+  const normalized = String(mimeType || "").split(";")[0].trim().toLowerCase();
+  if (normalized === "audio/wav" || normalized === "audio/mpeg" || normalized === "audio/mp3") return normalized;
+  return fallback;
 }
 
 function readVoiceSampleDataUrl(filePath) {
@@ -600,30 +857,38 @@ function buildChatContext(userContent) {
 async function callChatCompletions(messages, options = {}) {
   const settings = loadSettings();
   const route = getRoute(options.capability || "chat");
-  const apiKey = route.apiKey || settings.apiKey;
+  const apiKey = route.apiKey;
   const baseUrl = route.baseUrl || settings.apiBaseUrl;
   const model = options.model || route.model || settings.chatModel;
   const maxTokens = clampNumber(options.maxTokens ?? settings.chatMaxTokens, 80, 2000, 280);
   const temperature = options.temperature ?? 0.7;
 
-  if (!apiKey) {
+  if (!apiKey && !isLocalModelProvider(route.provider)) {
     throw new Error("API key is not configured yet. Open settings and add an OpenAI-compatible API key.");
   }
 
-  const base = baseUrl.replace(/\/$/, "");
-  const endpoint = route.endpoint || `${base}/chat/completions`;
-  const requestBody = {
-    model,
-    messages: messages.map(sanitizeMessageForModel),
-    temperature,
-  };
-
-  if (route.provider === "mimo") {
-    requestBody.max_completion_tokens = maxTokens;
-    requestBody.thinking = { type: "disabled" };
-  } else {
-    requestBody.max_tokens = maxTokens;
+  if (route.provider === "ollama") {
+    return callOllamaChat(messages, {
+      route,
+      model,
+      maxTokens,
+      temperature,
+      timeoutMs: options.timeoutMs || REQUEST_TIMEOUT_MS[options.capability || "chat"],
+      signal: options.signal,
+    });
   }
+
+  const base = baseUrl.replace(/\/$/, "");
+  const endpoint = route.provider === "mimo" ? getMimoChatEndpoint(route, baseUrl) : route.endpoint || `${base}/chat/completions`;
+  const requestBody =
+    route.provider === "mimo"
+      ? buildMimoChatRequestBody({ model, messages, maxTokens, temperature, stream: false })
+      : {
+          model,
+          messages: messages.map(sanitizeMessageForModel),
+          temperature,
+          max_tokens: maxTokens,
+        };
 
   const response = await fetchWithTimeout(
     endpoint,
@@ -646,6 +911,86 @@ async function callChatCompletions(messages, options = {}) {
 
   const json = await response.json();
   return json.choices?.[0]?.message?.content?.trim() || "";
+}
+
+async function callChatCompletionsStream(messages, options = {}) {
+  const settings = loadSettings();
+  const route = getRoute(options.capability || "chat");
+  const apiKey = route.apiKey;
+  const baseUrl = route.baseUrl || settings.apiBaseUrl;
+  const model = options.model || route.model || settings.chatModel;
+  const maxTokens = clampNumber(options.maxTokens ?? settings.chatMaxTokens, 80, 2000, 280);
+  const temperature = options.temperature ?? 0.7;
+
+  if (!options.onDelta) {
+    return callChatCompletions(messages, options);
+  }
+
+  if (!apiKey && !isLocalModelProvider(route.provider)) {
+    throw new Error("API key is not configured yet. Open settings and add an OpenAI-compatible API key.");
+  }
+
+  if (route.provider === "ollama") {
+    return callOllamaChatStream(messages, {
+      route,
+      model,
+      maxTokens,
+      temperature,
+      timeoutMs: options.timeoutMs || REQUEST_TIMEOUT_MS[options.capability || "chat"],
+      signal: options.signal,
+      onDelta: options.onDelta,
+    });
+  }
+
+  const base = baseUrl.replace(/\/$/, "");
+  const endpoint = route.provider === "mimo" ? getMimoChatEndpoint(route, baseUrl) : route.endpoint || `${base}/chat/completions`;
+  const requestBody =
+    route.provider === "mimo"
+      ? buildMimoChatRequestBody({ model, messages, maxTokens, temperature, stream: true })
+      : {
+          model,
+          messages: messages.map(sanitizeMessageForModel),
+          temperature,
+          max_tokens: maxTokens,
+          stream: true,
+        };
+
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: getAuthHeaders(route, apiKey),
+      body: JSON.stringify(requestBody),
+    },
+    {
+      timeoutMs: options.timeoutMs || REQUEST_TIMEOUT_MS[options.capability || "chat"],
+      signal: options.signal,
+      label: `${options.capability || "chat"} API`,
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    if ([400, 404, 422].includes(response.status) && /stream/i.test(text)) {
+      return callChatCompletions(messages, { ...options, onDelta: undefined });
+    }
+    throw new Error(`Chat API failed (${response.status}): ${text}`);
+  }
+
+  let buffer = "";
+  let fullText = "";
+  await readStreamText(response, (chunk) => {
+    buffer += chunk;
+    buffer = readSseJsonBuffer(buffer, (json) => {
+      const delta = getChatDeltaContent(json);
+      if (delta) {
+        fullText += delta;
+        options.onDelta(delta);
+      }
+    });
+  });
+
+  return fullText.trim();
 }
 
 async function compressMemoryIfNeeded() {
@@ -725,6 +1070,21 @@ function selectDesktopSource(sources) {
   );
 }
 
+function getVisionImagePayload(nativeImage) {
+  const size = nativeImage.getSize();
+  const maxDimension = 960;
+  const largest = Math.max(size.width, size.height);
+  const scale = largest > maxDimension ? maxDimension / largest : 1;
+  const width = Math.max(1, Math.round(size.width * scale));
+  const height = Math.max(1, Math.round(size.height * scale));
+  const image = scale < 1 ? nativeImage.resize({ width, height, quality: "good" }) : nativeImage;
+  return {
+    dataUrl: `data:image/jpeg;base64,${image.toJPEG(78).toString("base64")}`,
+    width,
+    height,
+  };
+}
+
 async function captureScreen(options = {}) {
   const settings = loadSettings();
   if (!settings.screenshotEnabled && !options.force) {
@@ -751,8 +1111,9 @@ async function captureScreen(options = {}) {
   let message = "";
 
   const visionRoute = getRoute("vision");
-  if (settings.visionUploadEnabled && visionRoute.enabled && visionRoute.apiKey) {
-    const imageBase64 = source.thumbnail.toPNG().toString("base64");
+  const canUseVisionRoute = settings.visionUploadEnabled && visionRoute.enabled && (visionRoute.apiKey || isLocalModelProvider(visionRoute.provider));
+  if (canUseVisionRoute) {
+    const visionImage = getVisionImagePayload(source.thumbnail);
     const visionPrompt =
       "You are fairy's desktop vision layer. Inspect the full desktop screenshot and return only compact JSON with keys: analysis, visibleText, shouldSpeak, message. analysis must be a concrete Chinese description of the active app/window, visible UI, important positions, and what the user appears to be doing. visibleText should list important visible words if any. message should be a short natural Chinese response fairy could say now. If sensitive-looking content is visible, mention that sensitive content may be on screen without copying exact secrets, keys, card numbers, passwords, or identity numbers. Never answer that you cannot see the screen.";
     const raw = await callChatCompletions(
@@ -760,8 +1121,8 @@ async function captureScreen(options = {}) {
         {
           role: "user",
           content: [
-            { type: "text", text: `${visionPrompt}\nWindow title: ${source.name}` },
-            { type: "image_url", image_url: { url: `data:image/png;base64,${imageBase64}` } },
+            { type: "text", text: `${visionPrompt}\nWindow title: ${source.name}\nVision image size: ${visionImage.width}x${visionImage.height}` },
+            { type: "image_url", image_url: { url: visionImage.dataUrl } },
           ],
         },
       ],
@@ -824,17 +1185,22 @@ async function transcribeAudio(audio, mimeType, options = {}) {
   const endpoint =
     route.endpoint ||
     settings.sttEndpoint ||
-    (route.provider === "mimo" ? `${base}/chat/completions` : `${base}/audio/transcriptions`);
+    (route.provider === "mimo" ? getMimoChatEndpoint(route, base) : `${base}/audio/transcriptions`);
   const buffer = Buffer.from(audio);
 
   if (route.provider === "mimo") {
-    const response = await fetchWithTimeout(
+    const mimoMimeType = normalizeMimoAudioMimeType(mimeType, "audio/wav");
+    const audioBase64 = buffer.toString("base64");
+    if (audioBase64.length > 10 * 1024 * 1024) {
+      throw new Error("MiMo ASR audio is too large after Base64 encoding. Keep it under 10 MB.");
+    }
+    const response = await fetchWithRateLimitRetry(
       endpoint,
       {
         method: "POST",
         headers: getAuthHeaders(route, apiKey),
         body: JSON.stringify({
-          model: route.model || "mimo-v2.5-asr",
+          model: route.model || MIMO_MODELS.asr,
           messages: [
             {
               role: "user",
@@ -842,14 +1208,14 @@ async function transcribeAudio(audio, mimeType, options = {}) {
                 {
                   type: "input_audio",
                   input_audio: {
-                    data: `data:${mimeType || "audio/webm"};base64,${buffer.toString("base64")}`,
+                    data: `data:${mimoMimeType};base64,${audioBase64}`,
                   },
                 },
               ],
             },
           ],
           asr_options: {
-            language: "auto",
+            language: "zh",
           },
         }),
       },
@@ -870,7 +1236,7 @@ async function transcribeAudio(audio, mimeType, options = {}) {
   form.append("file", blob, "fairy-voice.webm");
   form.append("model", route.model || settings.sttModel);
 
-  const response = await fetchWithTimeout(
+  const response = await fetchWithRateLimitRetry(
     endpoint,
     {
       method: "POST",
@@ -893,7 +1259,7 @@ async function synthesizeSpeech(text, options = {}) {
   const settings = loadSettings();
   const route = getRoute("tts");
   const base = (route.baseUrl || settings.apiBaseUrl).replace(/\/$/, "");
-  const endpoint = route.endpoint || settings.ttsEndpoint || (route.provider === "mimo" ? `${base}/chat/completions` : "");
+  const endpoint = route.endpoint || settings.ttsEndpoint || (route.provider === "mimo" ? getMimoChatEndpoint(route, base) : "");
   const apiKey = route.apiKey || settings.apiKey;
 
   if (settings.ttsProvider !== "custom" && route.provider !== "mimo") {
@@ -910,7 +1276,8 @@ async function synthesizeSpeech(text, options = {}) {
     }
 
     const hasVoiceSample = Boolean(settings.ttsVoiceSamplePath);
-    const model = hasVoiceSample ? "mimo-v2.5-tts-voiceclone" : route.model || "mimo-v2.5-tts";
+    const model = hasVoiceSample ? MIMO_MODELS.ttsVoiceClone : route.model || MIMO_MODELS.tts;
+    const voiceId = getMimoPresetVoice(settings);
     let audio = { format: "wav" };
     if (model.includes("voiceclone") || hasVoiceSample) {
       audio = {
@@ -925,11 +1292,13 @@ async function synthesizeSpeech(text, options = {}) {
     } else {
       audio = {
         ...audio,
-        voice: settings.ttsVoiceId || "mimo_default",
+        voice: voiceId,
       };
     }
 
-    const response = await fetchWithTimeout(
+    const voiceInstruction = getMimoTtsInstruction(model, voiceId, settings);
+
+    const response = await fetchWithRateLimitRetry(
       endpoint,
       {
         method: "POST",
@@ -939,9 +1308,7 @@ async function synthesizeSpeech(text, options = {}) {
           messages: [
             {
               role: "user",
-              content: model.includes("voiceclone")
-                ? "Use the cloned voice sample as the timbre. Speak like a natural close companion on a phone call: gentle, clear, emotionally present, and a little faster than formal narration."
-                : settings.ttsVoiceName || "Warm, natural, close conversational tone.",
+              content: voiceInstruction,
             },
             {
               role: "assistant",
@@ -976,7 +1343,11 @@ async function synthesizeSpeech(text, options = {}) {
       headers: getAuthHeaders(route, apiKey),
       body: JSON.stringify({
         text,
+        input: text,
+        model: route.model || undefined,
         voiceId: settings.ttsVoiceId,
+        voice_id: settings.ttsVoiceId,
+        voice: settings.ttsVoiceId,
       }),
     },
     { timeoutMs: REQUEST_TIMEOUT_MS.tts, signal: options.signal, label: "Speech synthesis" }
@@ -992,6 +1363,96 @@ async function synthesizeSpeech(text, options = {}) {
   return {
     audioBase64: Buffer.from(arrayBuffer).toString("base64"),
     mimeType,
+  };
+}
+
+function sendSpeechStreamEvent(webContents, requestId, event) {
+  if (!webContents || webContents.isDestroyed()) return;
+  webContents.send("speech:stream", { requestId, ...event });
+}
+
+function canStreamMimoTts(settings, route, model) {
+  return (
+    route.provider === "mimo" &&
+    model === MIMO_MODELS.tts &&
+    !settings.ttsVoiceSamplePath &&
+    !model.includes("voiceclone") &&
+    !model.includes("voicedesign")
+  );
+}
+
+async function synthesizeSpeechStream(text, options = {}) {
+  const settings = loadSettings();
+  const route = getRoute("tts");
+  const base = (route.baseUrl || settings.apiBaseUrl).replace(/\/$/, "");
+  const endpoint = route.endpoint || settings.ttsEndpoint || (route.provider === "mimo" ? getMimoChatEndpoint(route, base) : "");
+  const apiKey = route.apiKey || settings.apiKey;
+  const hasVoiceSample = Boolean(settings.ttsVoiceSamplePath);
+  const model = hasVoiceSample ? MIMO_MODELS.ttsVoiceClone : route.model || MIMO_MODELS.tts;
+  const voiceId = getMimoPresetVoice(settings);
+
+  if (!canStreamMimoTts(settings, route, model)) {
+    return { streamed: false, ...(await synthesizeSpeech(text, options)) };
+  }
+
+  if (!apiKey) {
+    throw new Error("MiMo API key is not configured yet.");
+  }
+
+  const response = await fetchWithRateLimitRetry(
+    endpoint,
+    {
+      method: "POST",
+      headers: getAuthHeaders(route, apiKey),
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "user",
+            content: getMimoTtsInstruction(model, voiceId, settings),
+          },
+          {
+            role: "assistant",
+            content: text,
+          },
+        ],
+        audio: {
+          format: "pcm16",
+          voice: voiceId,
+        },
+        stream: true,
+      }),
+    },
+    { timeoutMs: REQUEST_TIMEOUT_MS.tts, signal: options.signal, label: "Speech synthesis" }
+  );
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`MiMo streaming TTS failed (${response.status}): ${detail}`);
+  }
+
+  let buffer = "";
+  let chunkCount = 0;
+  await readStreamText(response, (chunk) => {
+    buffer += chunk;
+    buffer = readSseJsonBuffer(buffer, (json) => {
+      const audioBase64 = getAudioDeltaBase64(json);
+      if (audioBase64) {
+        chunkCount += 1;
+        options.onAudio?.({
+          audioBase64,
+          mimeType: "audio/pcm",
+          sampleRate: MIMO_AUDIO_STREAM_SAMPLE_RATE,
+        });
+      }
+    });
+  });
+
+  return {
+    streamed: true,
+    mimeType: "audio/pcm",
+    sampleRate: MIMO_AUDIO_STREAM_SAMPLE_RATE,
+    chunks: chunkCount,
   };
 }
 
@@ -1124,12 +1585,77 @@ ipcMain.handle("chat:send", async (_event, payload) => {
   }
 });
 
+ipcMain.handle("chat:stream", async (event, payload) => {
+  const content = typeof payload === "string" ? payload : payload?.content || "";
+  const context = typeof payload === "object" ? payload?.context || "" : "";
+  const requestId = typeof payload === "object" ? payload?.requestId || "" : "";
+  const controller = new AbortController();
+  const unregister = registerRequestController(requestId, controller);
+  try {
+    const userMessage = saveMessage("user", content, { source: "chat" });
+    sendChatStreamEvent(event.sender, requestId, { type: "user", message: userMessage });
+    const modelContent = context ? `${content}\n\n${context}` : content;
+    const answer = await callChatCompletionsStream(buildChatContext(modelContent), {
+      signal: controller.signal,
+      timeoutMs: REQUEST_TIMEOUT_MS.chat,
+      onDelta: (delta) => {
+        sendChatStreamEvent(event.sender, requestId, { type: "delta", delta });
+      },
+    });
+    const message = saveMessage("assistant", answer, { source: "chat", streamed: true });
+    sendChatStreamEvent(event.sender, requestId, { type: "done", message });
+    compressMemoryIfNeeded().catch((error) => {
+      console.error("Memory compression failed:", error);
+    });
+    return message;
+  } catch (error) {
+    sendChatStreamEvent(event.sender, requestId, {
+      type: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    unregister();
+  }
+});
+
 ipcMain.handle("speech:transcribe", (_event, payload) => {
   return transcribeAudio(payload.audio, payload.mimeType);
 });
 
-ipcMain.handle("speech:synthesize", (_event, payload) => {
-  return synthesizeSpeech(payload.text);
+ipcMain.handle("speech:synthesize", async (_event, payload = {}) => {
+  const requestId = payload?.requestId || "";
+  const controller = new AbortController();
+  const unregister = registerRequestController(requestId, controller);
+  try {
+    return await synthesizeSpeech(payload.text, { signal: controller.signal });
+  } finally {
+    unregister();
+  }
+});
+
+ipcMain.handle("speech:synthesizeStream", async (event, payload = {}) => {
+  const requestId = payload?.requestId || "";
+  const controller = new AbortController();
+  const unregister = registerRequestController(requestId, controller);
+  try {
+    const result = await synthesizeSpeechStream(payload.text, {
+      signal: controller.signal,
+      onAudio: (audio) => {
+        sendSpeechStreamEvent(event.sender, requestId, { type: "audio", ...audio });
+      },
+    });
+    sendSpeechStreamEvent(event.sender, requestId, { type: "done", result });
+    return result;
+  } catch (error) {
+    sendSpeechStreamEvent(event.sender, requestId, {
+      type: "error",
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  } finally {
+    unregister();
+  }
 });
 
 ipcMain.handle("screen:observe", async (_event, payload = {}) => {

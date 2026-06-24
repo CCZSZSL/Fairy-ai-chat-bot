@@ -1,470 +1,217 @@
 # fairy
 
-fairy is a local-first Windows desktop AI companion prototype.
+fairy is a local-first AI companion prototype for Windows. The current MVP is built with React, Vite, and an Electron bridge layer.
 
-It is built with Electron, React, Vite, and SQLite. The goal is to create a small always-available companion that can talk with you, remember long-running context locally, and optionally understand your current desktop screen when you explicitly ask it to look.
+## Current MVP
 
-> Status: early prototype. It works as a local desktop MVP, but packaging, privacy controls, provider adapters, and long-term memory retrieval still need more hardening.
+- Floating companion window UI with a 2D animated fairy avatar.
+- Local-first memory schema through SQLite in the Electron bridge.
+- Full raw messages are stored; rolling summaries are added when context grows.
+- Capability-based model routes:
+  - `chat` for normal conversation.
+  - `vision` for strong multimodal screen understanding.
+  - `stt` for external speech recognition.
+  - `tts` for MiMo preset speech synthesis, voice clone, or a custom voice endpoint.
+- Built-in route presets:
+  - DeepSeek: `https://api.deepseek.com`, `deepseek-v4-flash`, `deepseek-v4-pro`.
+  - MiMo: `https://api.xiaomimimo.com/v1`, `mimo-v2.5-pro`, `mimo-v2.5`, `mimo-v2.5-asr`, `mimo-v2.5-tts`.
+  - Ollama local models: `qwen3.5:4b`, `qwen3.5:9b`, `qwen3.6:27b`, `qwen3.6:35b`.
+  - Local OpenAI-compatible servers such as LM Studio, llama.cpp server, SGLang, vLLM.
+- Continuous call mode in the UI: microphone audio is segmented by silence, transcribed, sent to chat, and spoken back.
+- Optional screen observation switch, default off.
+- Screenshot storage and analysis are local by default. Vision upload must be explicitly enabled.
+- Sensitive source names are skipped before saving or analyzing screenshots.
+- Raw conversation memory stays local. Before context is sent to an external model, common API keys, tokens, passwords, and private-key blocks are redacted in the outbound request.
 
-## Why fairy exists
+## Local Paths
 
-Most chatbots feel like remote tools. fairy explores a different shape:
+This project keeps local data and caches outside the application bundle where possible:
 
-- a desktop companion that stays close to your workflow
-- local memory as the default source of continuity
-- external APIs as optional model routes, not the only possible backend
-- voice-first interaction that feels closer to a phone call
-- screen understanding only when the user asks for it
+- pnpm store: `<project-root>\.pnpm-store`
+- pnpm cache: `<project-root>\.pnpm-cache`
+- Electron cache script target: `<project-root>\.electron-cache`
+- temp download directory: `<project-root>\.tmp`
+- fairy memory: `<project-root>\fairy-memory`
+- recommended Ollama model storage on Windows: `E:\ollama-models`
 
-The long-term direction is a "code-life companion": an assistant that can gradually learn your projects, preferences, emotional context, and recurring work patterns while keeping raw memory on your own device.
-
-## Features
-
-- Floating desktop window for Windows.
-- Frameless always-on-top companion UI.
-- Animated 2D fairy avatar.
-- Local SQLite memory for:
-  - raw messages
-  - rolling summaries
-  - long-term memory records
-  - screenshot observations
-- Multi-route model interface:
-  - `chat`
-  - `vision`
-  - `stt`
-  - `tts`
-- OpenAI-compatible API shape for common providers.
-- Built-in presets for MiMo and DeepSeek.
-- Continuous call mode:
-  - microphone input
-  - voice activity detection
-  - external speech recognition
-  - text response
-  - spoken reply
-- On-demand desktop vision triggered by natural text or voice prompts.
-- Optional local screenshot saving.
-- Optional external vision upload.
-- Request timeout and cancel support.
-- Local memory backup with restore notes.
-- Outbound redaction for common API key, token, password, and private-key patterns.
-
-## What fairy is not yet
-
-- Not a polished production app.
-- Not a finished installer.
-- Not a privacy-audited security product.
-- Not a local model runtime yet.
-- Not a full agent framework.
-- Not cross-platform yet.
-
-The current target is Windows first. Linux and macOS support can be added later.
-
-## Tech Stack
-
-- Electron for the desktop shell.
-- React for the renderer UI.
-- Vite for development and build.
-- sql.js for local SQLite-style memory.
-- lucide-react for icons.
-- PowerShell helper scripts for Windows launch workflows.
-
-## Project Structure
-
-```text
-electron/
-  main.cjs              Electron main process, local memory, provider calls
-  preload.cjs           Safe renderer bridge
-  preload.d.ts          TypeScript bridge types
-
-src/
-  App.tsx               Main React app
-  mockBridge.ts         Browser/web-preview bridge fallback
-  styles.css            App styles
-  components/
-    FairyAvatar.tsx
-    SettingsPanel.tsx
-
-server/
-  fairy-local-server.cjs
-
-scripts/
-  open-fairy.ps1
-  start-fairy-web-shell.ps1
-  set-mimo-key.ps1
-  install-electron.cjs
-  test-screen-observe.cjs
-
-fairy-memory.example/
-  secrets.example.json
-```
-
-## Privacy Model
-
-fairy is designed to be local-first.
-
-By default, user memory is stored under:
-
-```text
-fairy-memory/
-```
-
-That folder may contain:
-
-- conversation history
-- summaries
-- screenshots
-- screen analysis
-- voice samples
-- API keys
-- backups
-
-Do not publish `fairy-memory/`.
-
-The repository `.gitignore` is configured to exclude local memory, generated builds, dependency folders, caches, screenshots, audio files, and databases.
-
-## External Model Calls
-
-fairy can call external APIs if you configure them.
-
-External routes are separated by capability:
-
-```text
-chat    normal conversation
-vision  desktop screenshot understanding
-stt     speech-to-text
-tts     text-to-speech
-```
-
-Before text is sent to a model route, fairy applies basic redaction for common secret patterns. This is a helpful guardrail, not a complete data-loss-prevention system.
-
-When `Use vision on request` is enabled, screenshots may be sent to your configured vision provider after you ask fairy to look at the screen.
-
-## Requirements
-
-- Windows 10 or newer.
-- Node.js 20 or newer.
-- pnpm 9 or newer.
-
-Recommended:
-
-- A stable network connection for Electron and model provider downloads.
-- A provider API key for chat.
-- A multimodal provider key if you want screen understanding.
-
-## Install
+You can override the memory root with:
 
 ```powershell
-pnpm install
-pnpm build
+$env:FAIRY_HOME='E:\fairy-memory'
 ```
 
-If Electron fails to download through the default install flow, try:
+Secrets are read from:
+
+```text
+<project-root>\fairy-memory\secrets.json
+```
+
+Set the MiMo key without putting it into command history:
 
 ```powershell
-pnpm electron:install
+.\scripts\set-mimo-key.ps1
 ```
 
 ## Run
 
-Development mode:
+Install dependencies, then run the web preview:
 
 ```powershell
-pnpm dev
-```
-
-Production-style local launch after build:
-
-```powershell
-.\open-fairy.cmd
-```
-
-Web preview:
-
-```powershell
+pnpm install
 pnpm dev:web
 ```
 
-Optional browser-shell preview:
+The web preview runs at:
+
+```text
+http://127.0.0.1:5173/
+```
+
+You can also open a desktop-like Chrome app window without installing Electron:
 
 ```powershell
 pnpm shell:web
 ```
 
-## First Setup
+This uses the existing system Chrome or Edge and stores its profile under:
 
-1. Install dependencies.
-2. Build the app.
-3. Launch fairy.
-4. Open settings.
-5. Configure model routes.
-6. Start with browser/system voice output.
-7. Enable vision only if you want screenshots to be analyzed by an external provider.
+```text
+<project-root>\.chrome-fairy-profile
+```
 
-## API Setup
+Desktop mode uses Electron:
 
-Open fairy settings and configure `Model Routes`.
+```powershell
+pnpm electron:install
+pnpm dev
+```
 
-### MiMo Example
+Electron's binary download may need a stable connection or a configured mirror.
+
+## Privacy Defaults
+
+- Screen observation is off by default.
+- Vision upload is off by default.
+- Screenshot images are saved only under `fairy-memory/screenshots`.
+- Sensitive window keywords are editable in settings.
+- Local memory export copies the SQLite database and screenshot folder into `fairy-memory/exports`.
+- Text sent to external model routes is redacted for common secret patterns; local raw memory is not altered.
+
+## Provider Notes
+
+- DeepSeek uses the OpenAI-compatible chat completions shape with `Authorization: Bearer <key>`.
+- MiMo uses the OpenAI-compatible `https://api.xiaomimimo.com/v1/chat/completions` endpoint and authenticates with `api-key: <key>`.
+- MiMo chat/vision requests use `max_completion_tokens` and `thinking: { "type": "disabled" }` for fast companion replies.
+- MiMo ASR uses `mimo-v2.5-asr`, `input_audio.data` data URLs, and `asr_options.language: "zh"` for Chinese call mode.
+- MiMo TTS uses `mimo-v2.5-tts` with preset `audio.voice: "茉莉"` by default.
+- MiMo low-latency TTS uses `stream: true` with `audio.format: "pcm16"` and plays returned 24 kHz PCM16 chunks through Web Audio.
+- MiMo voice design and voice clone routes remain available, but they fall back to non-streaming synthesis because the current low-latency stream is for preset `mimo-v2.5-tts`.
+- Local OpenAI-compatible routes do not require an API key. Use a base URL like `http://127.0.0.1:1234/v1`.
+- Ollama routes do not require an API key. Use `http://127.0.0.1:11434` and model names such as `qwen3.5:4b`, `qwen3.5:9b`, or `qwen3.6:27b`.
+
+## Local Model Setup
+
+### Ollama + Qwen
+
+Install Ollama, put model files outside the C drive, then start the Ollama server yourself in a separate terminal:
+
+```powershell
+mkdir E:\ollama-models
+setx OLLAMA_MODELS "E:\ollama-models"
+ollama serve
+```
+
+Recommended first local companion model:
+
+```powershell
+ollama pull qwen3.5:9b
+```
+
+Other options:
+
+```powershell
+ollama pull qwen3.5:4b
+ollama pull qwen3.5:9b
+ollama pull qwen3.6:27b
+ollama pull qwen3.6:35b
+```
+
+In fairy settings:
 
 ```text
 chat
-Provider: MiMo
-Base URL: https://api.xiaomimimo.com/v1
-Model: mimo-v2.5-pro
+Provider: Ollama
+Base URL: http://127.0.0.1:11434
+Model: qwen3.5:9b
 Endpoint: leave empty
-API key: your MiMo API key
-Enabled: on
-
-vision
-Provider: MiMo
-Base URL: https://api.xiaomimimo.com/v1
-Model: mimo-v2.5
-Endpoint: leave empty
-API key: your MiMo API key
-Enabled: on
-
-stt
-Provider: MiMo
-Base URL: https://api.xiaomimimo.com/v1
-Model: mimo-v2.5-asr
-Endpoint: leave empty
-API key: your MiMo API key
+API key: leave empty
 Enabled: on
 ```
 
-For the first run, keep voice output simple:
+fairy only calls the local Ollama HTTP API. It does not start or manage the Ollama process. Before using an Ollama route, make sure `ollama serve` is already running at:
 
 ```text
-Voice
-Output: Browser voice
-
-tts route
-Enabled: off
+http://127.0.0.1:11434
 ```
 
-Optional MiMo-generated speech:
-
-```text
-tts
-Provider: MiMo
-Base URL: https://api.xiaomimimo.com/v1
-Model: mimo-v2.5-tts
-Endpoint: leave empty
-API key: your MiMo API key
-Enabled: on
-```
-
-For desktop recognition:
+For local screen understanding, apply the same Ollama preset to `vision` and enable:
 
 ```text
 Screen
 Use vision on request: on
 ```
 
-Then fairy can respond to prompts like:
+Notes:
 
-```text
-你看看我在干什么？
-屏幕右上角这个怎么办？
-帮我看一下这个窗口
+- Qwen3.6 is newer and stronger, but much heavier.
+- Qwen3.5 4B/9B is a better first local test for normal machines.
+- Local vision quality depends on the selected model and available hardware.
+- A practical hybrid setup is local Ollama `qwen3.5:9b` for chat/vision plus MiMo `mimo-v2.5-tts` for cloud speech synthesis.
+
+### Intel Arc / Vulkan GPU Mode
+
+For Intel Arc integrated GPUs on Windows, set these variables in the terminal where you manually start Ollama:
+
+```powershell
+$env:OLLAMA_VULKAN = "1"
+$env:OLLAMA_LLM_LIBRARY = "vulkan"
+$env:OLLAMA_IGPU_ENABLE = "1"
+$env:GGML_VK_VISIBLE_DEVICES = "0"
+$env:OLLAMA_FLASH_ATTENTION = "0"
+ollama serve
 ```
 
-### DeepSeek Example
+You can verify GPU placement with:
 
-DeepSeek can be used for chat routes:
+```powershell
+ollama ps
+```
+
+Expected result for the current recommended local model:
+
+```text
+qwen3.5:9b    PROCESSOR    100% GPU
+```
+
+### LM Studio / llama.cpp / vLLM / SGLang
+
+Start a local OpenAI-compatible server, then configure:
 
 ```text
 chat
-Provider: DeepSeek
-Base URL: https://api.deepseek.com
-Model: deepseek-v4-flash
+Provider: Local OpenAI
+Base URL: http://127.0.0.1:1234/v1
+Model: local-model
 Endpoint: leave empty
-API key: your DeepSeek API key
+API key: leave empty
 Enabled: on
 ```
 
-Use a separate multimodal provider for `vision` if the selected chat provider does not support images.
+If your server exposes a nonstandard path, put the full URL in `Endpoint`.
 
-## Local Secrets File
-
-You can keep API keys outside the settings UI by creating:
-
-```text
-fairy-memory/secrets.json
-```
-
-Start from:
-
-```text
-fairy-memory.example/secrets.example.json
-```
-
-Example shape:
-
-```json
-{
-  "providers": {
-    "mimo": {
-      "apiKey": "paste-mimo-api-key-here"
-    },
-    "deepseek": {
-      "apiKey": "paste-deepseek-api-key-here"
-    }
-  }
-}
-```
-
-There is also a helper script:
+## Verify
 
 ```powershell
-.\scripts\set-mimo-key.ps1
-```
-
-## Screen Understanding
-
-fairy does not continuously upload your screen.
-
-The current behavior is request-based. If a user asks something that sounds like a screen question, fairy captures the desktop, optionally saves the screenshot locally, optionally sends it to the vision route, and then uses the returned analysis as context for the chat response.
-
-Example trigger phrases:
-
-```text
-你看看我在干什么？
-看我在干啥呢？
-屏幕右上角这个怎么办？
-这东西怎么处理？
-```
-
-If `Use vision on request` is off, fairy stores or reports local-only observation behavior and does not use external vision.
-
-## Voice Mode
-
-Call mode listens through the microphone and segments speech using silence detection.
-
-Flow:
-
-```text
-microphone -> speech segment -> STT route -> chat route -> spoken reply
-```
-
-The current prototype focuses on responsiveness rather than perfect transcription. Speech recognition quality depends heavily on the selected STT provider and microphone environment.
-
-## Memory
-
-fairy stores raw conversation locally. When context grows, it creates rolling summaries to reduce token use while preserving continuity.
-
-Current memory layers:
-
-- raw messages
-- rolling summaries
-- memory table for durable facts
-- screenshot observation table
-
-Future work should improve retrieval, memory editing, user-controlled forgetting, and migration tooling.
-
-## Backup and Restore
-
-The settings panel includes `Backup memory`.
-
-Backup output may include:
-
-- `fairy.sqlite`
-- `secrets.json`
-- `screenshots/`
-- `fairy-backup-manifest.json`
-- `RESTORE.txt`
-
-Backups can contain private data. Keep them private.
-
-## Development Commands
-
-```powershell
-pnpm install
-pnpm dev
 pnpm typecheck
 pnpm build
 ```
-
-Other scripts:
-
-```powershell
-pnpm dev:web
-pnpm dev:server
-pnpm shell:web
-pnpm electron:install
-pnpm start
-```
-
-## Troubleshooting
-
-### Electron did not download
-
-Run:
-
-```powershell
-pnpm electron:install
-```
-
-If the network is unstable, configure an Electron mirror or retry later.
-
-### The app says the API key is missing
-
-Open settings and fill the relevant model route API key, or create `fairy-memory/secrets.json`.
-
-### Screen questions still answer like text-only chat
-
-Check:
-
-- `vision` route is enabled.
-- `Use vision on request` is enabled.
-- The selected model supports image input.
-- The prompt actually asks fairy to look at the screen.
-
-### Speech recognition is inaccurate
-
-Try:
-
-- using a better microphone
-- lowering background noise
-- switching STT provider
-- setting the STT model route explicitly
-
-### The response is slow
-
-Possible causes:
-
-- full desktop screenshot upload
-- slow multimodal model
-- slow STT or TTS provider
-- network latency
-
-fairy has timeout and cancel support, but provider speed still matters.
-
-## Roadmap
-
-- Windows installer.
-- Provider adapter abstraction.
-- Better local model support.
-- Smarter memory retrieval.
-- Memory editor and forgetting controls.
-- More robust privacy controls for screen capture.
-- Optional region-based screen capture.
-- Better interruption and streaming voice UX.
-- 3D avatar mode.
-- Cross-platform support.
-
-## Contributing
-
-Contributions are welcome. See `CONTRIBUTING.md`.
-
-Please do not commit private memory, screenshots, voice samples, API keys, generated builds, dependency folders, or caches.
-
-## Security
-
-See `SECURITY.md`.
-
-This is an experimental prototype. Review provider behavior and your local data before using it with sensitive work.
-
-## License
-
-MIT

@@ -31,7 +31,8 @@ const STT_SAMPLE_RATE = 24000;
 const PRE_ROLL_MS = 550;
 const START_VOICE_FRAMES = 1;
 const INTERRUPT_VOICE_FRAMES = 4;
-const SPEECH_PLAYBACK_RATE = 1.18;
+const SPEECH_PLAYBACK_RATE = 1.22;
+const MIMO_TTS_STREAM_SAMPLE_RATE = 24000;
 
 function createRequestId() {
   return globalThis.crypto?.randomUUID?.() || `fairy-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -102,6 +103,42 @@ function cloneAudioChunk(input: Float32Array) {
 
 function containsAny(text: string, keywords: string[]) {
   return keywords.some((keyword) => text.includes(keyword));
+}
+
+function canUseGeneratedSpeech(settings: FairySettings | null) {
+  if (!settings) return false;
+  if (settings.ttsProvider === "custom" && settings.ttsEndpoint) return true;
+  return Boolean(settings.modelRoutes?.tts?.enabled && settings.modelRoutes.tts.provider === "mimo");
+}
+
+function canUseMimoStreamingSpeech(settings: FairySettings | null) {
+  const route = settings?.modelRoutes?.tts;
+  return Boolean(
+    settings &&
+      route?.enabled &&
+      route.provider === "mimo" &&
+      (route.model || "mimo-v2.5-tts") === "mimo-v2.5-tts" &&
+      !settings.ttsVoiceSamplePath,
+  );
+}
+
+function isRateLimitError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /429|too many requests|rate.?limit|limitation/i.test(message);
+}
+
+function base64ToPcmFloat32(base64: string) {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  const samples = new Float32Array(pcm.length);
+  for (let index = 0; index < pcm.length; index += 1) {
+    samples[index] = pcm[index] / 32768;
+  }
+  return samples;
 }
 
 function shouldAttachScreenContext(text: string) {
@@ -202,7 +239,13 @@ export function App() {
   const statusRef = useRef<StatusTone>("idle");
   const pendingVoiceTextRef = useRef("");
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const speechAudioContextRef = useRef<AudioContext | null>(null);
+  const speechAudioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const speechPcmEndTimeRef = useRef(0);
+  const activeSpeechRequestIdRef = useRef<string | null>(null);
   const speechTokenRef = useRef(0);
+  const speechQueueRef = useRef<string[]>([]);
+  const speechQueueRunningTokenRef = useRef<number | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const cancelRequestedRef = useRef(false);
 
@@ -245,12 +288,31 @@ export function App() {
 
   const stopSpeaking = useCallback(() => {
     speechTokenRef.current += 1;
+    speechQueueRef.current = [];
+    speechQueueRunningTokenRef.current = null;
     if (activeAudioRef.current) {
       activeAudioRef.current.pause();
       activeAudioRef.current.removeAttribute("src");
       activeAudioRef.current.load();
       activeAudioRef.current = null;
     }
+    const speechRequestId = activeSpeechRequestIdRef.current;
+    if (speechRequestId) {
+      activeSpeechRequestIdRef.current = null;
+      window.fairy.cancelRequest(speechRequestId).catch(() => {});
+    }
+    for (const source of speechAudioSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Source may already have ended.
+      }
+      source.disconnect();
+    }
+    speechAudioSourcesRef.current = [];
+    speechPcmEndTimeRef.current = 0;
+    speechAudioContextRef.current?.close().catch(() => {});
+    speechAudioContextRef.current = null;
     window.speechSynthesis.cancel();
     if (statusRef.current === "speaking") updateStatus("idle");
   }, [updateStatus]);
@@ -270,63 +332,222 @@ export function App() {
     updateStatus("idle");
   }, [stopSpeaking, updateStatus]);
 
-  const speak = useCallback(async (text: string) => {
-    const current = settingsRef.current;
-    if (!text.trim()) return;
-
+  const beginSpeechSession = useCallback(() => {
     const speechToken = speechTokenRef.current + 1;
     speechTokenRef.current = speechToken;
+    speechQueueRef.current = [];
     activeAudioRef.current?.pause();
     activeAudioRef.current = null;
     window.speechSynthesis.cancel();
+    return speechToken;
+  }, []);
 
-    const finishSpeaking = () => {
-      if (speechTokenRef.current !== speechToken) return;
-      activeAudioRef.current = null;
-      updateStatus("idle");
-    };
-
-    const playGeneratedAudio = async () => {
-      const audio = await window.fairy.synthesizeSpeech(text);
+  const playAudioClip = useCallback(
+    async (audio: { audioBase64: string; mimeType: string }, speechToken: number) => {
       if (speechTokenRef.current !== speechToken) return;
       const player = new Audio(`data:${audio.mimeType};base64,${audio.audioBase64}`);
       player.playbackRate = SPEECH_PLAYBACK_RATE;
       (player as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
       activeAudioRef.current = player;
-      player.onended = finishSpeaking;
-      player.onerror = finishSpeaking;
       updateStatus("speaking");
-      await player.play();
-    };
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          if (activeAudioRef.current === player) activeAudioRef.current = null;
+          resolve();
+        };
+        player.onended = done;
+        player.onerror = done;
+        player.play().catch(done);
+      });
+    },
+    [updateStatus],
+  );
 
-    try {
-      if (current?.ttsProvider === "custom" && current.ttsEndpoint) {
-        await playGeneratedAudio();
-        return;
+  const playPcm16Chunk = useCallback(
+    async (audioBase64: string, sampleRate: number, speechToken: number) => {
+      if (speechTokenRef.current !== speechToken) return;
+      let audioContext = speechAudioContextRef.current;
+      if (!audioContext || audioContext.state === "closed") {
+        audioContext = new AudioContext({ sampleRate: sampleRate || MIMO_TTS_STREAM_SAMPLE_RATE });
+        speechAudioContextRef.current = audioContext;
+        speechPcmEndTimeRef.current = 0;
       }
+      if (audioContext.state === "suspended") await audioContext.resume();
 
-      if (current?.modelRoutes?.tts?.enabled && current.modelRoutes.tts.provider === "mimo") {
-        await playGeneratedAudio();
-        return;
-      }
+      const samples = base64ToPcmFloat32(audioBase64);
+      if (!samples.length || speechTokenRef.current !== speechToken) return;
 
+      const buffer = audioContext.createBuffer(1, samples.length, sampleRate || MIMO_TTS_STREAM_SAMPLE_RATE);
+      buffer.copyToChannel(samples, 0);
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      const startAt = Math.max(audioContext.currentTime + 0.04, speechPcmEndTimeRef.current || 0);
+      speechPcmEndTimeRef.current = startAt + buffer.duration;
+      speechAudioSourcesRef.current.push(source);
+      source.onended = () => {
+        speechAudioSourcesRef.current = speechAudioSourcesRef.current.filter((item) => item !== source);
+      };
+      updateStatus("speaking");
+      source.start(startAt);
+    },
+    [updateStatus],
+  );
+
+  const waitForPcmPlaybackEnd = useCallback(async (speechToken: number) => {
+    const audioContext = speechAudioContextRef.current;
+    if (!audioContext || speechTokenRef.current !== speechToken) return;
+    const remainingMs = Math.max(0, (speechPcmEndTimeRef.current - audioContext.currentTime) * 1000);
+    if (remainingMs > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, remainingMs + 80));
+    }
+  }, []);
+
+  const playBrowserSpeech = useCallback(
+    async (text: string, speechToken: number) => {
+      if (!text.trim() || speechTokenRef.current !== speechToken) return;
+      window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = SPEECH_PLAYBACK_RATE;
       utterance.pitch = 1.04;
+      const current = settingsRef.current;
       const voices = window.speechSynthesis.getVoices();
       const wantedVoice = current?.ttsVoiceName
         ? voices.find((voice) => voice.name === current.ttsVoiceName)
         : undefined;
       if (wantedVoice) utterance.voice = wantedVoice;
-      utterance.onend = finishSpeaking;
-      utterance.onerror = finishSpeaking;
       updateStatus("speaking");
-      window.speechSynthesis.speak(utterance);
-    } catch (error) {
-      updateStatus("idle");
-      setNotice(error instanceof Error ? error.message : String(error));
-    }
-  }, [updateStatus]);
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        utterance.onend = done;
+        utterance.onerror = done;
+        window.speechSynthesis.speak(utterance);
+      });
+    },
+    [updateStatus],
+  );
+
+  const playGeneratedSpeech = useCallback(
+    async (text: string, speechToken: number) => {
+      const current = settingsRef.current;
+      if (canUseMimoStreamingSpeech(current)) {
+        const requestId = `${createRequestId()}-tts`;
+        activeSpeechRequestIdRef.current = requestId;
+        let streamError: Error | null = null;
+        const chunkPromises: Promise<void>[] = [];
+        const removeSpeechStreamListener = window.fairy.onSpeechStream((event) => {
+          if (event.requestId !== requestId || speechTokenRef.current !== speechToken) return;
+          if (event.type === "audio") {
+            const promise = playPcm16Chunk(event.audioBase64, event.sampleRate, speechToken);
+            chunkPromises.push(promise);
+          } else if (event.type === "error") {
+            streamError = new Error(event.message);
+          }
+        });
+
+        try {
+          const result = await window.fairy.synthesizeSpeechStream(text, requestId);
+          if (streamError) throw streamError;
+          if (result.streamed) {
+            await Promise.all(chunkPromises);
+            await waitForPcmPlaybackEnd(speechToken);
+            return;
+          }
+          await playAudioClip(result, speechToken);
+          return;
+        } finally {
+          removeSpeechStreamListener();
+          if (activeSpeechRequestIdRef.current === requestId) activeSpeechRequestIdRef.current = null;
+        }
+      }
+
+      const requestId = `${createRequestId()}-tts`;
+      activeSpeechRequestIdRef.current = requestId;
+      try {
+        const audio = await window.fairy.synthesizeSpeech(text, requestId);
+        await playAudioClip(audio, speechToken);
+      } finally {
+        if (activeSpeechRequestIdRef.current === requestId) activeSpeechRequestIdRef.current = null;
+      }
+    },
+    [playAudioClip, playPcm16Chunk, waitForPcmPlaybackEnd],
+  );
+
+  const drainSpeechQueue = useCallback(
+    async (speechToken: number) => {
+      if (speechQueueRunningTokenRef.current === speechToken) return;
+      speechQueueRunningTokenRef.current = speechToken;
+      let failedChunk = "";
+      try {
+        while (speechTokenRef.current === speechToken) {
+          const chunk = speechQueueRef.current.shift();
+          if (!chunk) break;
+          failedChunk = chunk;
+          await playGeneratedSpeech(chunk, speechToken);
+          failedChunk = "";
+          if (speechTokenRef.current !== speechToken) break;
+        }
+      } catch (error) {
+        if (speechTokenRef.current === speechToken) {
+          if (isRateLimitError(error)) {
+            const fallbackText = [failedChunk, ...speechQueueRef.current].filter(Boolean).join(" ");
+            speechQueueRef.current = [];
+            setNotice("MiMo voice is rate limited. Using local system voice for this reply.");
+            await playBrowserSpeech(fallbackText, speechToken);
+            if (speechTokenRef.current === speechToken) updateStatus("idle");
+          } else {
+            setNotice(error instanceof Error ? error.message : String(error));
+            updateStatus("idle");
+          }
+        }
+      } finally {
+        if (speechQueueRunningTokenRef.current === speechToken) {
+          speechQueueRunningTokenRef.current = null;
+          if (speechTokenRef.current === speechToken && speechQueueRef.current.length) {
+            void drainSpeechQueue(speechToken);
+          } else if (speechTokenRef.current === speechToken && statusRef.current === "speaking") {
+            updateStatus("idle");
+          }
+        }
+      }
+    },
+    [playBrowserSpeech, playGeneratedSpeech, updateStatus],
+  );
+
+  const enqueueGeneratedSpeech = useCallback(
+    (text: string, speechToken: number) => {
+      if (speechTokenRef.current !== speechToken) return;
+      const chunk = text.replace(/\s+/g, " ").trim();
+      if (!chunk) return;
+      speechQueueRef.current.push(chunk);
+      updateStatus("speaking");
+      void drainSpeechQueue(speechToken);
+    },
+    [drainSpeechQueue, updateStatus],
+  );
+
+  const speak = useCallback(
+    async (text: string) => {
+      const current = settingsRef.current;
+      if (!text.trim()) return;
+
+      const speechToken = beginSpeechSession();
+
+      try {
+        if (canUseGeneratedSpeech(current)) {
+          enqueueGeneratedSpeech(text, speechToken);
+          return;
+        }
+
+        await playBrowserSpeech(text, speechToken);
+        if (speechTokenRef.current === speechToken) updateStatus("idle");
+      } catch (error) {
+        updateStatus("idle");
+        setNotice(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [beginSpeechSession, enqueueGeneratedSpeech, playBrowserSpeech, updateStatus],
+  );
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -345,6 +566,8 @@ export function App() {
       const requestId = createRequestId();
       activeRequestIdRef.current = requestId;
       cancelRequestedRef.current = false;
+      let removeChatStreamListener = () => {};
+      let streamedAnswer = "";
       try {
         let screenContext = "";
         if (shouldAttachScreenContext(content)) {
@@ -356,7 +579,37 @@ export function App() {
           updateStatus("thinking");
         }
 
-        const assistant = await window.fairy.sendChat(content, screenContext, requestId);
+        const createdAt = new Date().toISOString();
+        const tempUserId = -Date.now();
+        const tempAssistantId = tempUserId - 1;
+        setMessages((previous) => [
+          ...previous,
+          { id: tempUserId, role: "user", content, createdAt, metadata: { temporary: true } },
+          { id: tempAssistantId, role: "assistant", content: "", createdAt, metadata: { temporary: true, streaming: true } },
+        ]);
+
+        removeChatStreamListener = window.fairy.onChatStream((event) => {
+          if (event.requestId !== requestId) return;
+          if (event.type === "delta") {
+            streamedAnswer += event.delta;
+            setMessages((previous) =>
+              previous.map((message) =>
+                message.id === tempAssistantId ? { ...message, content: streamedAnswer } : message,
+              ),
+            );
+          }
+
+          if (event.type === "done" && !streamedAnswer) {
+            streamedAnswer = event.message.content;
+            setMessages((previous) =>
+              previous.map((message) =>
+                message.id === tempAssistantId ? { ...message, content: event.message.content } : message,
+              ),
+            );
+          }
+        });
+
+        const assistant = await window.fairy.sendChatStream(content, screenContext, requestId);
         await refresh();
         if (cancelRequestedRef.current) return;
         await speak(assistant.content);
@@ -373,6 +626,7 @@ export function App() {
         const pending = pendingVoiceTextRef.current;
         const wasCanceled = cancelRequestedRef.current;
         pendingVoiceTextRef.current = "";
+        removeChatStreamListener();
         if (activeRequestIdRef.current === requestId) activeRequestIdRef.current = null;
         cancelRequestedRef.current = false;
         busyRef.current = false;

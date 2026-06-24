@@ -25,7 +25,74 @@ const routeIcons: Record<RouteKey, ReactNode> = {
   tts: <Volume2 size={15} />,
 };
 
+const mimoPresetVoices = ["茉莉", "冰糖", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean", "mimo_default"];
+
 const routePresets: RoutePreset[] = [
+  {
+    id: "ollama-qwen35-4b",
+    label: "Ollama Qwen3.5 4B",
+    routes: ["chat", "vision"],
+    route: {
+      provider: "ollama",
+      label: "Local Ollama Qwen3.5 4B",
+      baseUrl: "http://127.0.0.1:11434",
+      model: "qwen3.5:4b",
+      endpoint: "",
+      enabled: true,
+    },
+  },
+  {
+    id: "ollama-qwen35-9b",
+    label: "Ollama Qwen3.5 9B",
+    routes: ["chat", "vision"],
+    route: {
+      provider: "ollama",
+      label: "Local Ollama Qwen3.5 9B",
+      baseUrl: "http://127.0.0.1:11434",
+      model: "qwen3.5:9b",
+      endpoint: "",
+      enabled: true,
+    },
+  },
+  {
+    id: "ollama-qwen36-27b",
+    label: "Ollama Qwen3.6 27B",
+    routes: ["chat", "vision"],
+    route: {
+      provider: "ollama",
+      label: "Local Ollama Qwen3.6 27B",
+      baseUrl: "http://127.0.0.1:11434",
+      model: "qwen3.6:27b",
+      endpoint: "",
+      enabled: true,
+    },
+  },
+  {
+    id: "ollama-qwen36-35b",
+    label: "Ollama Qwen3.6 35B",
+    routes: ["chat", "vision"],
+    route: {
+      provider: "ollama",
+      label: "Local Ollama Qwen3.6 35B",
+      baseUrl: "http://127.0.0.1:11434",
+      model: "qwen3.6:35b",
+      endpoint: "",
+      enabled: true,
+    },
+  },
+  {
+    id: "lmstudio-local",
+    label: "LM Studio local",
+    routes: ["chat", "vision"],
+    route: {
+      provider: "local-openai",
+      label: "Local OpenAI-compatible chat",
+      baseUrl: "http://127.0.0.1:1234/v1",
+      model: "local-model",
+      endpoint: "",
+      enabled: true,
+    },
+  },
   {
     id: "deepseek-flash",
     label: "DeepSeek V4 Flash",
@@ -93,11 +160,11 @@ const routePresets: RoutePreset[] = [
   },
   {
     id: "mimo-tts",
-    label: "MiMo TTS",
+    label: "MiMo TTS 茉莉",
     routes: ["tts"],
     route: {
       provider: "mimo",
-      label: "MiMo speech synthesis",
+      label: "MiMo speech synthesis - 茉莉",
       baseUrl: "https://api.xiaomimimo.com/v1",
       model: "mimo-v2.5-tts",
       endpoint: "",
@@ -140,6 +207,14 @@ export function SettingsPanel({ settings, stats, onClose, onSave, onExport }: Se
   const applyPreset = (routeKey: RouteKey, preset: RoutePreset) => {
     setDraft((current) => ({
       ...current,
+      ...(routeKey === "tts" && preset.id === "mimo-tts"
+        ? {
+            ttsProvider: "custom" as const,
+            ttsVoiceId: "茉莉",
+            ttsVoiceName: "茉莉",
+            ttsVoiceSamplePath: "",
+          }
+        : {}),
       modelRoutes: {
         ...current.modelRoutes,
         [routeKey]: {
@@ -221,6 +296,8 @@ export function SettingsPanel({ settings, stats, onClose, onSave, onExport }: Se
                     <option value="openai-compatible">OpenAI compatible</option>
                     <option value="deepseek">DeepSeek</option>
                     <option value="mimo">MiMo</option>
+                    <option value="local-openai">Local OpenAI</option>
+                    <option value="ollama">Ollama</option>
                     <option value="custom">Custom</option>
                   </select>
                   <input value={route.baseUrl} placeholder="Base URL" onChange={changeString((value) => setRoute(routeKey, "baseUrl", value))} />
@@ -263,7 +340,7 @@ export function SettingsPanel({ settings, stats, onClose, onSave, onExport }: Se
               <span>Output</span>
               <select value={draft.ttsProvider} onChange={changeString((value) => setField("ttsProvider", value as FairySettings["ttsProvider"]))}>
                 <option value="browser">Browser voice</option>
-                <option value="custom">Custom cloned voice</option>
+                <option value="custom">Model route voice</option>
               </select>
             </label>
             <label className="field">
@@ -278,8 +355,27 @@ export function SettingsPanel({ settings, stats, onClose, onSave, onExport }: Se
               </select>
             </label>
             <label className="field">
-              <span>Built-in voice ID</span>
-              <input value={draft.ttsVoiceId} onChange={changeString((value) => setField("ttsVoiceId", value))} />
+              <span>MiMo preset voice</span>
+              <select
+                value={draft.ttsVoiceId || "茉莉"}
+                onChange={changeString((value) =>
+                  setDraft((current) => ({
+                    ...current,
+                    ttsVoiceId: value,
+                    ttsVoiceName: value,
+                    ttsVoiceSamplePath: "",
+                  })),
+                )}
+              >
+                {!mimoPresetVoices.includes(draft.ttsVoiceId) && draft.ttsVoiceId ? (
+                  <option value={draft.ttsVoiceId}>{draft.ttsVoiceId}</option>
+                ) : null}
+                {mimoPresetVoices.map((voice) => (
+                  <option value={voice} key={voice}>
+                    {voice}
+                  </option>
+                ))}
+              </select>
             </label>
             <label className="field">
               <span>Voice sample</span>
